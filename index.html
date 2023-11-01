@@ -1,0 +1,179 @@
+<head>
+    <script src="https://unpkg.com/json5@2/dist/index.min.js"></script>
+    <script>
+        console.log(document.getElementById('openai_api_key'))
+        window.onload = function () {
+            openai_api_key.value = "sk-XXXXXXX" // ONLY PUT THIS HERE TEMPORARILY FOR TESTING
+        };
+        let lastAPIcall = +new Date();
+
+        function drawHighlights(originalText, quotePositions, finalCutoff = undefined) {
+            // Sort quotePositions by start position
+            quotePositions.sort((a, b) => a.start - b.start);
+
+            // Merge any overlapping quotes
+            for (let i = 0; i < quotePositions.length - 1; i++) {
+                const { start, end } = quotePositions[i];
+                for (let j = i + 1; j < quotePositions.length; j++) {
+                    const { start: start2, end: end2 } = quotePositions[j];
+                    if (start2 <= end && end2 >= start) {
+                        // Merge
+                        quotePositions[i].start = Math.min(start, start2);
+                        quotePositions[i].end = Math.max(end, end2);
+                        quotePositions[i].quote = originalText.slice(quotePositions[i].start, quotePositions[i].end);
+                        quotePositions.splice(j, 1);
+                        j--; // Adjust the index due to removal
+                    }
+                }
+            }
+
+            // add gray hightlight for unprocessed text
+            if (finalCutoff !== undefined) {
+                originalText = originalText.slice(0, finalCutoff) + `<span style="background-color:lightgray">${originalText.slice(finalCutoff)}</span>`
+            }
+
+            // Modify originalText to include the highlights, starting from the last quote
+            for (let i = quotePositions.length - 1; i >= 0; i--) {
+                const { start, end, quote } = quotePositions[i];
+                originalText = originalText.slice(0, start) + `<span style="background-color:yellow">${quote}</span>` + originalText.slice(end);
+            }
+
+            output.innerHTML = originalText;
+        }
+
+        async function checkDoc() {
+            const OPENAI_API_KEY = openai_api_key.value
+            if (!OPENAI_API_KEY) {
+                alert("Please enter your OpenAI API key")
+                return
+            }
+            if (!document_to_test.value.trim()) {
+                alert("Please enter some text to check")
+                return
+            }
+
+            output.innerHTML = ""
+            console.log("checking doc")
+            console.log("status", status_span)
+            const sourceText = document.getElementById("document_to_test").value
+            let quotePositions = [];  // Keep track of the positions of quotes to be highlighted
+
+            // empty the highlights
+            drawHighlights(sourceText, quotePositions, 0)
+
+            const chunks = []
+            const chunkSize = 200, overlap = 50;
+            if (overlap >= chunkSize) {
+                alert("overlap must be < chunkSize")
+            }
+            let errors = 0
+            for (let i = 0; i < sourceText.length; i += (chunkSize - overlap)) {
+                const chunkStart = i;
+                console.log("chunkStart", chunkStart)
+                if (sourceText.length < chunkSize) {
+                    status_span.innerHTML = "Checking document..."
+                } else {
+                    status_span.innerHTML = "Checking chunk " + (Math.ceil(i / chunkSize) + 1) + " of " + Math.ceil(sourceText.length / chunkSize)
+                }
+                const chunk = sourceText.slice(i, i + chunkSize);
+                chunks.push(chunk)
+                const prompt = `Given the following background about p-value interpretation:
+
+---
+P values are not valid measures of evidence. If the null-hypothesis is true, P values are uniformly distributed, and it is just as likely to observe a P value of 0.001 as it is to observe a P value of 0.999. Therefore, the interpretation of P = 0.001 as strong evidence cannot be defended just because the probability to observe this P value is small. After all, if the null hypothesis is true, the probability of observing P = 0.999 is exactly as small.
+---
+
+Does the following excerpt include a misunderstanding of p-values or statistics? If so, return a JSON list of strings, each a quote from the excerpt that contain the misunderstanding. Do not explain. If there are none, return "[]".
+
+---
+${chunk}
+---
+`
+                while (+new Date() - lastAPIcall < 500) {
+                    await new Promise(r => setTimeout(r, 100 + Math.random() * 100));
+                }
+                lastAPIcall = +new Date();
+
+                try {
+                    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${OPENAI_API_KEY}`
+                        },
+                        body: JSON.stringify({
+                            model: 'gpt-4',
+                            messages: [
+                                {
+                                    role: 'system',
+                                    content: 'You are a helpful assistant.'
+                                },
+                                {
+                                    role: 'user',
+                                    content: prompt
+                                }
+                            ]
+                        })
+                    });
+                    const data = await response.json();
+                    console.log("data",data)
+                    if (data.error) {
+                        status_span.innerHTML = "Error: " + data.error.message
+                        alert("Error: " + data.error.message)
+                        return
+                    }
+                    const aiResponse = data.choices[0].message.content
+                    console.log(aiResponse)
+                    status_span.innerHTML = "Processing AI response..."
+                    const aiResponseJSON = JSON5.parse(aiResponse)
+                    // newHTML = chunk
+                    // check if it's an array
+                    if (Array.isArray(aiResponseJSON)) {
+                        // if it is, then it's a list of quotes
+                        // so we can add them to the output
+                        for (const quote of aiResponseJSON) {
+                            const startInChunk = chunk.indexOf(quote);
+                            if (startInChunk !== -1) {
+                                const start = chunkStart + startInChunk;
+                                const end = start + quote.length;
+                                console.log("quote", quote, start, end)
+                                if (!quotePositions.some(pos => pos.start === start && pos.end === end)) {
+                                    console.log("adding quote", quote)
+                                    quotePositions.push({ start, end, quote });
+                                }
+                                errors++;
+                            }
+                        }
+                        drawHighlights(sourceText, quotePositions, chunkStart + chunkSize)
+                    } else {
+                        console.error("aiResponseJSON is not an array", aiResponseJSON)
+                    }
+                    //output.innerHTML += newHTML
+                } catch (e) {
+                    status_span.innerHTML = "Error: " + e
+                    alert("Error: " + e)
+                    return
+                }
+            }
+            drawHighlights(sourceText, quotePositions)
+            status_span.innerHTML = "Done! " + quotePositions.length + " error(s) found."
+        }
+    </script>
+</head>
+
+<body style="width:100%; height:100%; font-family: sans-serif; margin:0;padding:0">
+    <div style="width:100%; text-align: center;">
+        <div style="padding:10px">Prototype Misconception Checker (<a href="https://github.com/paulcalcraft/mischeck" target="_blank">context & code here</a>, for <a href="https://twitter.com/lakens/status/1719643133934211561" target="_blank">@lakens</a> by <a href="https://twitter.com/paul_cal" target="_blank">@paul_cal</a>) </div>
+        <label for="openai_api_key">Enter OpenAI key (not saved) [<a href="https://platform.openai.com/account/api-keys" target="_blank">Find yours</a>]:&nbsp;&nbsp;<input type="password" id="openai_api_key"
+                placeholder="OpenAI API key"
+                style="width: 300px; margin: 10px auto;" /></label>
+        <button style="clear:both; margin: 10px auto;" onclick="checkDoc()">Check for errors</button>
+    </div>
+    <textarea
+        style="padding: 20px; margin:20px; font-family: sans-serif; font-size: 16px; float: left; width: 35%; height:70%; overflow-y: scroll; resize: none;"
+        id="document_to_test" placeholder="Enter document text here, then click 'Check for errors' above"></textarea>
+
+    <div style="padding: 20px; margin:20px; float:right; width: 40%; height:70%; overflow-y: scroll;"><div style="padding:20px">Errors will be
+        highlighted below. <div id="status_span"></div></div><div id="output" style="white-space: pre-wrap;"></div>
+    </div>
+</body>
